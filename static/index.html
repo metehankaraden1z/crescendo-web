@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crescendo — Rate every track</title>
+  <meta name="description" content="Search any album, rate it song by song, and watch your taste profile build itself. Powered by MusicBrainz.">
+  <meta name="theme-color" content="#0E0D0A">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,800&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar" id="topbar"></header>
+  <main id="view" tabindex="-1"></main>
+  <footer class="footer">
+    <div class="footer-inner">
+      <span class="brand-mini"><svg class="logo-mark" viewBox="0 0 28 20" aria-hidden="true"><path d="M3 10 25 3M3 10l22 7"/></svg> Crescendo</span>
+      <span>Music data from <a href="https://musicbrainz.org" target="_blank" rel="noopener">MusicBrainz</a> · Cover art from the <a href="https://coverartarchive.org" target="_blank" rel="noopener">Cover Art Archive</a></span>
+    </div>
+  </footer>
+  <div id="modal-root"></div>
+  <div id="toast-root" aria-live="polite"></div>
+  <div id="tip" role="tooltip" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>
