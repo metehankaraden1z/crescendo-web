@@ -13,18 +13,53 @@ Nothing to install: the server is a single Python file using only the standard l
 python3 server.py                 # → http://127.0.0.1:8000
 python3 server.py --port 9000
 python3 server.py --host 0.0.0.0  # reachable from other devices on your network
-python3 server.py --seed-demo     # optional: demo accounts (mustafa / elif_k / can.polat, password "password123")
+python3 server.py --seed-demo     # optional: demo accounts mustafa / elif_k / can.polat
 ```
 
-Requires Python 3.9+. The database is created automatically at `data/crescendo.db`.
+Requires Python 3.9+. `--seed-demo` gives each demo account a random password and prints it once; on a
+public server, don't seed demo accounts at all.
+
+The database is created automatically in your user data folder, **not** in the project folder:
+
+| OS | Default location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\Crescendo\crescendo.db` |
+| macOS | `~/Library/Application Support/Crescendo/crescendo.db` |
+| Linux | `$XDG_DATA_HOME/crescendo/crescendo.db` (usually `~/.local/share/...`) |
+
+Projects often live in synced folders (OneDrive, Dropbox, iCloud). Those copy SQLite's database and its
+`-wal`/`-shm` files separately while the server writes, which can corrupt the database. If an older
+`data/crescendo.db` exists in the project, the first start copies it to the new location (with SQLite's
+backup API) and leaves the old file alone.
 
 | Env var | Purpose |
 |---|---|
-| `CRESCENDO_DB` | Path of the SQLite file (default `data/crescendo.db`) |
+| `CRESCENDO_DB` | Path of the SQLite file (overrides the default location above) |
+| `CRESCENDO_GOOGLE_CLIENT_ID` | Turns on "Continue with Google" (see below) |
+| `CRESCENDO_TURNSTILE_SITEKEY` / `CRESCENDO_TURNSTILE_SECRET` | Turns on the Cloudflare Turnstile robot check for sign‑up |
 | `CRESCENDO_SECURE=1` | Mark the session cookie `Secure` (set this when serving over HTTPS) |
 | `CRESCENDO_MB_UA` | User‑Agent sent to MusicBrainz. Put your own app name and contact here |
 | `CRESCENDO_QUIET=1` | Silence the request log |
 | `CRESCENDO_DEBUG_MB=1` | Log each MusicBrainz call with timing |
+
+### Sign in with Google (optional)
+
+1. In [Google Cloud Console](https://console.cloud.google.com/apis/credentials) create an **OAuth client ID**
+   of type **Web application**.
+2. Under **Authorized JavaScript origins** add every address the site is opened from, e.g.
+   `http://localhost:8000` and `https://your-domain`. No redirect URIs are needed.
+3. Start the server with `CRESCENDO_GOOGLE_CLIENT_ID=<the client id>`.
+
+The server checks every Google sign‑in with Google (`tokeninfo`), and only accepts tokens issued to this
+client ID for a verified address. First‑time Google users pick a username; their email is not stored.
+
+### Robot check on sign‑up (optional)
+
+1. In the Cloudflare dashboard open **Turnstile**, add a widget for your domain (and `localhost`).
+2. Start the server with `CRESCENDO_TURNSTILE_SITEKEY=<site key>` and `CRESCENDO_TURNSTILE_SECRET=<secret key>`.
+
+For local testing Cloudflare publishes keys that always pass: site key `1x00000000000000000000AA`, secret
+`1x0000000000000000000000000000000AA`. Without these variables both features are simply off.
 
 ## Features
 
@@ -35,12 +70,15 @@ Requires Python 3.9+. The database is created automatically at `data/crescendo.d
   rate, and Shift adds a half star.
 - **Taste DNA:** a genre fingerprint, a rating curve, and top albums, songs and artists.
 - **Social:** a taste match % with every listener, follows, an activity feed and Listen Later.
-- **Accounts:** salted scrypt password hashes and HttpOnly session cookies.
+- **Accounts:** username + password (salted scrypt hashes) or Google; HttpOnly session cookies. Change or
+  set a password, sign out of every device, or delete the account and everything in it.
+- **Security:** a strict Content‑Security‑Policy (no inline scripts, no framing by other sites), same‑origin
+  checks on every write, and failed logins limited per account and per IP.
 
 ## Database
 
 ```
-users(id, username UNIQUE NOCASE, password_hash, bio, created_at)
+users(id, username UNIQUE NOCASE, password_hash, google_sub UNIQUE, bio, created_at)
 sessions(token_hash, user_id, created_at, expires_at)          -- only SHA‑256 of the token is stored
 follows(follower_id, followee_id, created_at)
 
@@ -66,14 +104,18 @@ Requests that change data must use `Content-Type: application/json`. Errors come
 
 | Method & path | Purpose |
 |---|---|
-| `POST /api/auth/register` · `POST /api/auth/login` | `{username, password}` → `{user}` and a session cookie |
+| `GET /api/config` | Which sign‑in options are on: `{google_client_id, turnstile_sitekey}` |
+| `POST /api/auth/register` · `POST /api/auth/login` | `{username, password[, captcha]}` → `{user}` and a session cookie |
+| `POST /api/auth/google` | `{credential[, username]}` → `{user}`, or `{needs_username, suggestion}` on first sign‑in |
 | `POST /api/auth/logout` · `GET /api/me` · `PUT /api/me` | End session · current user · update `{bio}` |
+| `POST /api/me/password` · `POST /api/me/logout-all` | `{current_password, new_password}` · end every session |
+| `DELETE /api/me` | Delete the account: `{password}`, or `{confirm: username}` for Google‑only accounts |
 | `GET /api/search?q=&type=album\|artist` | MusicBrainz search; album searches may include `artist` + `artist_albums` |
 | `GET /api/search/local?q=` · `GET /api/suggest?q=` | Instant local matches · type‑ahead suggestions |
 | `GET /api/album/<release-group id>` | Album, tracklist, community stats, your ratings, reviews |
 | `GET /api/artist/<id>` · `GET /api/artist/<id>/other` | Artist, studio albums and EPs · live albums, compilations and more |
 | `PUT /api/ratings/song` | `{song, album, score}`; `score` is 1–10, or `null` to clear |
-| `PUT /api/ratings/album` · `PUT /api/ratings/artist` | `{album\|artist, score, review}` |
+| `PUT /api/ratings/album` · `PUT /api/ratings/artist` | `{album\|artist, score, review}`; a review needs a score |
 | `POST`/`DELETE /api/listen-later/<id>` | Add or remove an album |
 | `GET /api/users/<name>` · `POST`/`DELETE /api/users/<name>/follow` | Profile with Taste DNA · follow and unfollow |
 | `GET /api/people` · `GET /api/home` | Listeners ranked by taste match · home feed, trending, stats |
@@ -89,8 +131,10 @@ so those are retried after 0.3–0.6 s.
 Every response is cached in `mb_cache` (searches for a day, albums and artists for 30 days), so anything
 viewed once loads straight from SQLite. On top of that:
 
-* **Search:** albums and artists already on Crescendo show instantly from SQLite (`/api/search/local`);
-  MusicBrainz results replace them a moment later. Every search box suggests results as you type
+* **Search:** albums and artists already on Crescendo show instantly from SQLite (`/api/search/local`)
+  while the MusicBrainz search runs at the same time. Results are ranked by match, number of editions
+  (well‑known records have many) and activity on Crescendo, so common titles such as "Graduation" lead
+  with the record people mean; when the query names an artist, that artist's releases come first. Every search box suggests results as you type
   (`/api/suggest` runs the album and artist searches side by side).
 * **Artist pages:** one search call fetches official studio albums and EPs, run in parallel with the
   artist lookup. Live albums, compilations and bootlegs, which can run to hundreds, load only when asked
@@ -105,7 +149,7 @@ Set `CRESCENDO_DEBUG_MB=1` to log every MusicBrainz call with its duration and r
 
 `server.py` is a long‑running process, so it needs a host that runs Python, such as a small VPS, Fly.io,
 Railway or Render (GitHub Pages only serves static files). Put it behind HTTPS (for example Caddy or nginx)
-and set `CRESCENDO_SECURE=1`. Keep `data/` on a persistent volume.
+and set `CRESCENDO_SECURE=1`. Point `CRESCENDO_DB` at a persistent volume.
 
 Credits: music data from [MusicBrainz](https://musicbrainz.org), cover art from the
 [Cover Art Archive](https://coverartarchive.org).

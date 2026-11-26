@@ -595,3 +595,24 @@ h1, h2, h3 { font-family: var(--display); font-weight: 600; letter-spacing: -.02
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   .demo-row .stars-fill { width: var(--w); }
 }
+
+/* ---------- phones: search gets its own full-width row in the top bar ---------- */
+@media (max-width: 560px) {
+  .topbar-inner { flex-wrap: wrap; height: auto; padding-top: 10px; padding-bottom: 10px; row-gap: 10px; }
+  .nav-search { order: 3; flex: 1 1 100%; max-width: none; }
+}
+
+/* ---------- sign-in extras: Google button, robot check ---------- */
+.alt-auth { margin: 0 0 18px; }
+.g-btn { display: flex; justify-content: center; min-height: 44px; }
+.or { display: flex; align-items: center; gap: 12px; margin: 18px 0 2px; color: var(--muted); font-size: 13px; }
+.or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line-2); }
+.ts-box { display: flex; justify-content: center; min-height: 65px; margin: 4px 0 6px; }
+
+/* ---------- account settings ---------- */
+.acct-section { padding-top: 22px; margin-top: 22px; border-top: 1px solid var(--line); }
+.acct-section h3 { font-size: 20px; margin-bottom: 8px; }
+.acct-section > p { font-size: 14px; margin: 0 0 14px; }
+.danger-zone h3 { color: var(--danger); }
+.btn-danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+.btn-danger:hover { background: var(--danger); color: #160b08; }
