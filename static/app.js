@@ -9,6 +9,7 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const state = {
   me: null,
+  config: {},         // { google_client_id, turnstile_sitekey } from /api/config
   renderId: 0,
   onRated: null,      // page-level hook called after a rating is saved
   reviews: {},        // "album:<id>" / "artist:<id>" -> current review text
@@ -219,8 +220,13 @@ function loadingHTML(msg = "Loading…") {
 
 function errorHTML(err) {
   return `<div class="wrap"><div class="loading"><h2>Hit a wrong note.</h2><p class="muted">${esc(err.message)}</p>
-    <button class="btn btn-ghost" onclick="render()">Try again</button></div></div>`;
+    <button class="btn btn-ghost" data-retry-render>Try again</button></div></div>`;
 }
+
+// Inline onclick handlers are blocked by the Content-Security-Policy, so wire it here.
+document.addEventListener("click", (e) => {
+  if (e.target.closest && e.target.closest("[data-retry-render]")) render();
+});
 
 /* ---------- star widget behaviour ---------- */
 
@@ -377,8 +383,61 @@ function closeModal() {
   root.innerHTML = "";
 }
 
+/* ---------- third-party sign-in widgets (loaded only when the auth window opens) ---------- */
+
+const scriptLoads = new Map();
+function loadScript(src) {
+  if (!scriptLoads.has(src)) {
+    scriptLoads.set(src, new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = src;
+      s.async = true;
+      s.onload = resolve;
+      s.onerror = () => { scriptLoads.delete(src); reject(new Error("Couldn't load " + src)); };
+      document.head.append(s);
+    }));
+  }
+  return scriptLoads.get(src);
+}
+
+async function mountGoogleButton(el, onCredential) {
+  const id = state.config && state.config.google_client_id;
+  if (!id || !el) return;
+  try {
+    await loadScript("https://accounts.google.com/gsi/client");
+    google.accounts.id.initialize({ client_id: id, callback: (r) => onCredential(r.credential), ux_mode: "popup" });
+    google.accounts.id.renderButton(el, {
+      theme: "filled_black", size: "large", shape: "pill", text: "continue_with", width: Math.min(392, el.clientWidth || 392),
+    });
+  } catch {
+    el.closest(".alt-auth").hidden = true; // blocked by an extension or offline: just hide it
+  }
+}
+
+async function mountTurnstile(el, onToken) {
+  const key = state.config && state.config.turnstile_sitekey;
+  if (!key || !el) return null;
+  await loadScript("https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit");
+  return turnstile.render(el, {
+    sitekey: key, theme: "dark", action: "signup",
+    callback: (t) => onToken(t), "expired-callback": () => onToken(""), "error-callback": () => onToken(""),
+  });
+}
+
+/* ---------- auth window ---------- */
+
+async function finishAuth(user, { created = false, reason = "" } = {}) {
+  state.me = user;
+  prefetched.clear();
+  closeModal();
+  await applyPendingRating();
+  if (created && reason !== "rate") toast(`Welcome, ${user.username}! Search an album to start rating.`);
+  if (session) { session.stale = true; renderTopbar(); } else render();
+}
+
 function openAuth(mode = "join", reason = "") {
   const join = mode === "join";
+  const cfg = state.config || {};
   const lede = reason === "rate"
     ? "Your rating is ready to save. Create a free account and it's yours — along with every rating after it."
     : join ? "Rate every track you love (and the ones you don't). Your taste profile builds itself." : "Good to have you back.";
@@ -387,6 +446,7 @@ function openAuth(mode = "join", reason = "") {
     <h2 style="margin-top:8px">${join ? "Claim your taste." : "Log in"}</h2>
     <p class="lede">${lede}</p>
     ${join ? `<div class="perks"><span>✦ Rate albums song by song, in half-stars</span><span>✦ Get your Taste DNA — genres, habits, all-time favorites</span><span>✦ See your match % with every listener</span></div>` : ""}
+    ${cfg.google_client_id ? `<div class="alt-auth"><div id="g-btn" class="g-btn"></div><div class="or"><span>or with a username</span></div></div>` : ""}
     <form id="auth-form" novalidate>
       <div class="field"><label for="au-user">Username</label>
         <input id="au-user" name="username" autocomplete="username" required maxlength="24" spellcheck="false">
@@ -394,30 +454,82 @@ function openAuth(mode = "join", reason = "") {
       <div class="field"><label for="au-pass">Password</label>
         <input id="au-pass" name="password" type="password" autocomplete="${join ? "new-password" : "current-password"}" required minlength="${join ? 8 : 1}">
         ${join ? `<span class="hint">At least 8 characters.</span>` : ""}</div>
+      ${join && cfg.turnstile_sitekey ? `<div class="ts-box" id="ts-box"></div>` : ""}
       <div class="form-error" id="au-err" role="alert"></div>
       <button class="btn btn-gold btn-lg" style="width:100%" type="submit">${join ? "Create my account" : "Log in"}</button>
     </form>
     <div class="switch">${join ? `Already have an account? <button data-switch="login">Log in</button>` : `New here? <button data-switch="join">Create an account</button>`}</div>
   `, { onClose: () => sessionStorage.removeItem("pendingRating") });
+
+  const err = $("#au-err", m);
   $("[data-switch]", m).addEventListener("click", (e) => openAuth(e.target.dataset.switch, reason));
+
+  let captcha = "", widget = null;
+  if (join) mountTurnstile($("#ts-box", m), (t) => { captcha = t; }).then((w) => { widget = w; })
+    .catch(() => { err.textContent = "The robot check couldn't load. Check your connection or try another browser."; });
+
+  mountGoogleButton($("#g-btn", m), (credential) => googleSignIn(credential, reason));
+
   $("#auth-form", m).addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = e.target;
     const btn = $("button[type=submit]", f);
+    err.textContent = "";
+    if (join && cfg.turnstile_sitekey && !captcha) {
+      err.textContent = "Please complete the “I'm not a robot” check first.";
+      return;
+    }
     btn.disabled = true;
-    $("#au-err").textContent = "";
     try {
-      const { user } = await api("POST", join ? "/api/auth/register" : "/api/auth/login", {
-        username: f.username.value.trim(), password: f.password.value,
-      });
-      state.me = user;
-      prefetched.clear();
-      $("#modal-root").innerHTML = "";
-      await applyPendingRating();
-      if (join && reason !== "rate") toast(`Welcome, ${user.username}! Search an album to start rating.`);
-      if (session) { session.stale = true; renderTopbar(); } else render();
-    } catch (err) {
-      $("#au-err").textContent = err.message;
+      const body = { username: f.username.value.trim(), password: f.password.value };
+      if (join) body.captcha = captcha;
+      const { user } = await api("POST", join ? "/api/auth/register" : "/api/auth/login", body);
+      await finishAuth(user, { created: join, reason });
+    } catch (ex) {
+      err.textContent = ex.message;
+      btn.disabled = false;
+      // A Turnstile token is single-use: get a fresh one for the next attempt.
+      if (join && widget != null && window.turnstile) { captcha = ""; turnstile.reset(widget); }
+    }
+  });
+}
+
+async function googleSignIn(credential, reason, username) {
+  try {
+    const res = await api("POST", "/api/auth/google", username ? { credential, username } : { credential });
+    if (res.user) return finishAuth(res.user, { created: !!username, reason });
+    if (res.needs_username) return pickUsername(credential, reason, res.suggestion);
+  } catch (ex) {
+    if (username) throw ex; // shown inside the username step
+    const box = $("#au-err");
+    if (box) box.textContent = ex.message; else toast(ex.message, true);
+  }
+}
+
+// First Google sign-in: choose the public username people will see.
+function pickUsername(credential, reason, suggestion) {
+  const m = openModal(`
+    <span class="eyebrow">Almost there</span>
+    <h2 style="margin-top:8px">Pick a username.</h2>
+    <p class="lede">This is the name other listeners see. Your Google email stays private.</p>
+    <form id="pick-form" novalidate>
+      <div class="field"><label for="pk-user">Username</label>
+        <input id="pk-user" name="username" required maxlength="24" spellcheck="false" value="${esc(suggestion || "")}">
+        <span class="hint">3–24 characters: letters, numbers, dots, underscores.</span></div>
+      <div class="form-error" id="pk-err" role="alert"></div>
+      <button class="btn btn-gold btn-lg" style="width:100%" type="submit">Create my account</button>
+    </form>`, { onClose: () => sessionStorage.removeItem("pendingRating") });
+  $("#pick-form", m).addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = $("button[type=submit]", e.target);
+    btn.disabled = true;
+    $("#pk-err", m).textContent = "";
+    try {
+      await googleSignIn(credential, reason, e.target.username.value.trim());
+    } catch (ex) {
+      $("#pk-err", m).textContent = ex.status === 401
+        ? "That Google sign-in expired. Close this and choose “Continue with Google” again."
+        : ex.message;
       btn.disabled = false;
     }
   });
@@ -814,6 +926,9 @@ VIEWS.search = async (view, route, alive) => {
       results.innerHTML = `<div class="empty-state">Type an album or artist name to search MusicBrainz.</div>`;
       return;
     }
+    // Both requests start now: MusicBrainz is the slow one, so it shouldn't wait for the local answer.
+    const remote = api("GET", `/api/search?q=${encodeURIComponent(term)}&type=${type}`, null, controller.signal);
+    remote.catch(() => {}); // handled below; avoids an "unhandled rejection" if we bail out early
     // 1) instant: what Crescendo already knows
     try {
       const local = await api("GET", `/api/search/local?q=${encodeURIComponent(term)}`, null, controller.signal);
@@ -827,7 +942,7 @@ VIEWS.search = async (view, route, alive) => {
     status.innerHTML = `<span class="eq eq-sm"><span></span><span></span><span></span></span>Searching all of MusicBrainz…`;
     // 2) complete: MusicBrainz
     try {
-      const data = await api("GET", `/api/search?q=${encodeURIComponent(term)}&type=${type}`, null, controller.signal);
+      const data = await remote;
       if (my !== seq || !alive()) return;
       status.innerHTML = "";
       if (type === "album" && data.artist) results.innerHTML = artistAndAlbumsHTML(data);
@@ -1325,7 +1440,7 @@ VIEWS.user = async (view, route, alive) => {
       </div>
     </div>
     <div class="match-box">
-      ${me ? `<button class="btn btn-ghost btn-sm" id="edit-bio">Edit bio</button><button class="btn btn-quiet btn-sm" id="logout">Log out</button>`
+      ${me ? `<button class="btn btn-ghost btn-sm" id="edit-bio">Edit bio</button><button class="btn btn-ghost btn-sm" id="account">Account</button><button class="btn btn-quiet btn-sm" id="logout">Log out</button>`
         : d.match ? `<div class="ring ring-lg" style="--p:${d.match.percent}"><span>${d.match.percent}%<small>match</small></span></div>
           <div class="why">${d.match.shared_genres.length ? "You both love " + d.match.shared_genres.slice(0, 3).map(esc).join(", ") : "Rate more to sharpen this"}${d.match.common ? ` · ${plural(d.match.common, "rating")} in common` : ""}</div>`
         : !state.me ? `<button class="btn btn-ghost btn-sm" data-auth="join">See your match %</button>` : ""}
@@ -1389,6 +1504,8 @@ VIEWS.user = async (view, route, alive) => {
   });
   const lo = $("#logout", view);
   if (lo) lo.addEventListener("click", logout);
+  const acct = $("#account", view);
+  if (acct) acct.addEventListener("click", openAccount);
   const eb = $("#edit-bio", view);
   if (eb) eb.addEventListener("click", () => {
     const m = openModal(`<h2>Edit bio</h2><p class="lede">A line or two about what you listen to.</p>
@@ -1400,6 +1517,92 @@ VIEWS.user = async (view, route, alive) => {
     });
   });
 };
+
+/* ---------- account settings ---------- */
+
+async function openAccount() {
+  let me = state.me;
+  try { me = (await api("GET", "/api/me")).user || me; } catch { /* use what we have */ }
+  if (!me) return openAuth("login");
+  const pw = me.has_password;
+  const m = openModal(`
+    <h2>Account</h2>
+    <p class="lede">Signed in as <b>${esc(me.username)}</b>${me.google ? " · linked to Google" : ""}.</p>
+
+    <form id="pw-form" class="acct-section" novalidate>
+      <h3>${pw ? "Change password" : "Set a password"}</h3>
+      ${pw ? "" : `<p class="muted">You sign in with Google. A password lets you log in with your username too.</p>`}
+      ${pw ? `<div class="field"><label for="pw-cur">Current password</label>
+        <input id="pw-cur" name="current" type="password" autocomplete="current-password" required></div>` : ""}
+      <div class="field"><label for="pw-new">New password</label>
+        <input id="pw-new" name="next" type="password" autocomplete="new-password" required minlength="8">
+        <span class="hint">At least 8 characters. Other devices get signed out.</span></div>
+      <div class="form-error" id="pw-err" role="alert"></div>
+      <button class="btn btn-gold" type="submit" style="width:100%">${pw ? "Change password" : "Set password"}</button>
+    </form>
+
+    <div class="acct-section">
+      <h3>Sessions</h3>
+      <p class="muted">Lost a device or used a shared computer? Sign out of Crescendo everywhere, including here.</p>
+      <button class="btn btn-ghost" id="logout-all" style="width:100%">Sign out of all devices</button>
+    </div>
+
+    <form id="del-form" class="acct-section danger-zone" novalidate>
+      <h3>Delete account</h3>
+      <p class="muted">Permanently deletes your account and every rating, review, follow and list. This can't be undone.</p>
+      ${pw ? `<div class="field"><label for="del-pw">Password</label>
+          <input id="del-pw" name="password" type="password" autocomplete="current-password" required></div>`
+        : `<div class="field"><label for="del-confirm">Type <b>${esc(me.username)}</b> to confirm</label>
+          <input id="del-confirm" name="confirm" autocomplete="off" spellcheck="false" required></div>`}
+      <div class="form-error" id="del-err" role="alert"></div>
+      <button class="btn btn-danger" type="submit" style="width:100%">Delete my account</button>
+    </form>`);
+
+  $("#pw-form", m).addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target, btn = $("button[type=submit]", f);
+    btn.disabled = true;
+    $("#pw-err", m).textContent = "";
+    try {
+      const { user } = await api("POST", "/api/me/password",
+        { current_password: f.current ? f.current.value : "", new_password: f.next.value });
+      state.me = user;
+      closeModal();
+      toast(pw ? "Password changed. Other devices were signed out." : "Password set.");
+    } catch (ex) {
+      $("#pw-err", m).textContent = ex.message;
+      btn.disabled = false;
+    }
+  });
+
+  $("#logout-all", m).addEventListener("click", async () => {
+    try { await api("POST", "/api/me/logout-all"); } catch (ex) { return toast(ex.message, true); }
+    state.me = null;
+    closeModal();
+    toast("Signed out of every device.");
+    location.hash = "#/";
+    render();
+  });
+
+  $("#del-form", m).addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target, btn = $("button[type=submit]", f);
+    btn.disabled = true;
+    $("#del-err", m).textContent = "";
+    try {
+      await api("DELETE", "/api/me", pw ? { password: f.password.value } : { confirm: f.confirm.value });
+    } catch (ex) {
+      $("#del-err", m).textContent = ex.message;
+      btn.disabled = false;
+      return;
+    }
+    state.me = null;
+    closeModal();
+    toast("Your account was deleted.");
+    location.hash = "#/";
+    render();
+  });
+}
 
 /* ---------- people ---------- */
 
@@ -1430,10 +1633,9 @@ VIEWS.people = async (view, route, alive) => {
 /* ---------- boot ---------- */
 
 (async function boot() {
-  try {
-    const { user } = await api("GET", "/api/me");
-    state.me = user;
-  } catch { /* offline: render anyway */ }
+  const [me, config] = await Promise.allSettled([api("GET", "/api/me"), api("GET", "/api/config")]);
+  if (me.status === "fulfilled") state.me = me.value.user;      // offline: render anyway
+  if (config.status === "fulfilled") state.config = config.value; // which sign-in options are on
   lastPath = location.hash.split("?")[0];
   render();
 })();

@@ -26,19 +26,39 @@ import secrets
 import socket
 import sqlite3
 import ssl
+import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from email.utils import formatdate, parsedate_to_datetime
 from http import HTTPStatus
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(ROOT, "static")
-DB_PATH = os.environ.get("CRESCENDO_DB", os.path.join(ROOT, "data", "crescendo.db"))
+LEGACY_DB_PATH = os.path.join(ROOT, "data", "crescendo.db")
+
+
+def default_db_path():
+    """Keep the database in the OS's per-user data folder, not next to the code.
+
+    The code often lives in a synced folder (OneDrive, Dropbox, iCloud). Those tools copy
+    SQLite's database and -wal/-shm files independently while the server is writing, which
+    can corrupt the database, so the default location is outside the project."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+        return os.path.join(base, "Crescendo", "crescendo.db")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Crescendo/crescendo.db")
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "crescendo", "crescendo.db")
+
+
+DB_PATH = os.environ.get("CRESCENDO_DB") or default_db_path()
 SECURE_COOKIES = os.environ.get("CRESCENDO_SECURE") == "1"
 
 MB_HOST = "musicbrainz.org"
@@ -50,6 +70,12 @@ MB_USER_AGENT = os.environ.get(
 MB_RATE = 1.0   # sustained requests/second (MusicBrainz asks for ~1/s on average)
 MB_BURST = 3    # short bursts are tolerated; lets independent lookups overlap
 MB_DEBUG = os.environ.get("CRESCENDO_DEBUG_MB") == "1"
+
+# Sign-in with Google (optional): the OAuth "Web application" client ID from Google Cloud Console.
+GOOGLE_CLIENT_ID = os.environ.get("CRESCENDO_GOOGLE_CLIENT_ID", "").strip()
+# Cloudflare Turnstile robot check on sign-up (optional). Both keys come from the Cloudflare dashboard.
+TURNSTILE_SITEKEY = os.environ.get("CRESCENDO_TURNSTILE_SITEKEY", "").strip()
+TURNSTILE_SECRET = os.environ.get("CRESCENDO_TURNSTILE_SECRET", "").strip()
 
 SESSION_COOKIE = "cr_session"
 SESSION_DAYS = 30
@@ -196,11 +222,36 @@ def db():
     return conn
 
 
+def migrate_legacy_db():
+    """One-time copy of a database from the old in-project location (data/crescendo.db).
+
+    Uses SQLite's online backup, which folds in anything still sitting in the -wal file.
+    The old file is left where it is; nothing is deleted."""
+    if os.environ.get("CRESCENDO_DB") or os.path.exists(DB_PATH) or not os.path.exists(LEGACY_DB_PATH):
+        return
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    src = sqlite3.connect(LEGACY_DB_PATH)
+    dst = sqlite3.connect(DB_PATH)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    print(f"Copied your database from {LEGACY_DB_PATH}\n  to {DB_PATH}\n"
+          f"  (the old copy was left in place; delete it once you're happy)", flush=True)
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    migrate_legacy_db()
     conn = db()
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    # Columns added after the first release: add them to existing databases too.
+    user_cols = {r["name"] for r in rows("PRAGMA table_info(users)")}
+    if "google_sub" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")  # Google's stable account id
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL")
 
 
 class Tx:
@@ -262,20 +313,121 @@ def create_session(user_id):
     return token
 
 
+def has_password(user):
+    return bool(user.get("password_hash"))
+
+
+# Failed-login throttling. Keyed by (ip, username) so one person's typos never lock out
+# everyone else behind the same address (a campus network, a proxy); a much higher
+# per-IP ceiling still stops one address from guessing across many accounts.
+LOGIN_WINDOW = 600
+LOGIN_MAX_PER_ACCOUNT = 10
+LOGIN_MAX_PER_IP = 50
 _login_failures = defaultdict(list)
 _login_lock = threading.Lock()
 
 
-def too_many_failures(ip):
-    cutoff = time.time() - 600
-    with _login_lock:
-        _login_failures[ip] = [t for t in _login_failures[ip] if t > cutoff]
-        return len(_login_failures[ip]) >= 10
+def _recent(key, cutoff):
+    _login_failures[key] = [t for t in _login_failures[key] if t > cutoff]
+    if not _login_failures[key]:
+        del _login_failures[key]
+        return 0
+    return len(_login_failures[key])
 
 
-def record_failure(ip):
+def too_many_failures(ip, username):
+    cutoff = time.time() - LOGIN_WINDOW
     with _login_lock:
-        _login_failures[ip].append(time.time())
+        return (_recent(("acct", ip, username.lower()), cutoff) >= LOGIN_MAX_PER_ACCOUNT
+                or _recent(("ip", ip), cutoff) >= LOGIN_MAX_PER_IP)
+
+
+def record_failure(ip, username):
+    t = time.time()
+    with _login_lock:
+        _login_failures[("acct", ip, username.lower())].append(t)
+        _login_failures[("ip", ip)].append(t)
+
+
+def clear_failures(ip, username):
+    with _login_lock:
+        _login_failures.pop(("acct", ip, username.lower()), None)
+
+
+# A fixed hash to check against when the username doesn't exist, so a wrong username
+# takes as long as a wrong password and response time doesn't reveal which accounts exist.
+_DUMMY_HASH = hash_password(secrets.token_urlsafe(16))
+
+
+# ---------------------------------------------------------------------------
+# Third-party verification: Google sign-in and Cloudflare Turnstile
+# ---------------------------------------------------------------------------
+
+def _https_json(url, data=None, timeout=10):
+    """GET (or form-POST when `data` is given) a JSON endpoint. Returns (status, json-or-None)."""
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, headers={"User-Agent": "Crescendo/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8"))
+        except ValueError:
+            return e.code, None
+    except (OSError, ValueError):
+        return 0, None
+
+
+def verify_turnstile(token, ip):
+    """True when Cloudflare confirms the sign-up form was filled in by a person."""
+    if not TURNSTILE_SECRET:
+        return True  # not configured: the check is off
+    if not token or len(token) > 2048:
+        return False
+    status, data = _https_json("https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                               {"secret": TURNSTILE_SECRET, "response": token, "remoteip": ip})
+    return bool(status == 200 and data and data.get("success"))
+
+
+GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
+
+
+def verify_google_credential(credential):
+    """Check a Google Identity Services ID token and return its claims, or None.
+
+    Google's tokeninfo endpoint validates the signature and expiry; we then make sure the
+    token was issued to *this* app (aud), by Google (iss), for a verified address."""
+    if not GOOGLE_CLIENT_ID or not credential or len(credential) > 4096:
+        return None
+    status, claims = _https_json("https://oauth2.googleapis.com/tokeninfo?"
+                                 + urllib.parse.urlencode({"id_token": credential}))
+    if status != 200 or not claims:
+        return None
+    if claims.get("aud") != GOOGLE_CLIENT_ID or claims.get("iss") not in GOOGLE_ISSUERS:
+        return None
+    try:
+        if int(claims.get("exp", 0)) < now():
+            return None
+    except ValueError:
+        return None
+    if str(claims.get("email_verified")).lower() != "true" or not claims.get("sub"):
+        return None
+    return claims
+
+
+def username_suggestion(claims):
+    """A free username based on the Google account's email or name."""
+    base = re.sub(r"[^A-Za-z0-9_.]", "", (claims.get("email") or "").split("@")[0])[:20]
+    if len(base) < 3:
+        base = re.sub(r"[^A-Za-z0-9_.]", "", (claims.get("given_name") or "listener"))[:20] or "listener"
+    base = base.ljust(3, "_")
+    name = base
+    for _ in range(20):
+        if not one("SELECT 1 AS x FROM users WHERE username = ?", (name,)):
+            return name
+        name = f"{base[:19]}{secrets.randbelow(10000)}"
+    return f"listener{secrets.randbelow(10**6)}"
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +716,7 @@ def load_album(rgid, force=False):
                               (rgid, disc_no, t.get("position") or 0, rec["id"]))
         c.execute("UPDATE albums SET release_mbid = ?, tracks_at = ? WHERE mbid = ?",
                   (release["id"] if release else None, now(), rgid))
+    forget_taste()  # this album's genres may have changed
 
     album = one("SELECT * FROM albums WHERE mbid = ?", (rgid,))
     if not genres and album["artist_mbid"]:
@@ -580,6 +733,7 @@ def borrow_artist_genres(rgid, artist_mbid):
     with Tx() as c:
         for g in json.loads(artist["genres"])[:5]:
             c.execute("INSERT OR IGNORE INTO album_genres (album_mbid, genre, votes) VALUES (?,?,1)", (rgid, g))
+    forget_taste()
 
 
 def load_artist(mbid):
@@ -649,38 +803,101 @@ def tokens(text):
     return set(re.findall(r"\w+", (text or "").lower()))
 
 
-def search_albums(q):
+MINOR_SECONDARY = {"Compilation", "Live", "Remix", "DJ-mix", "Mixtape/Street"}
+
+
+def rank_album(a, qt, mb_score, heat=0):
+    """Relevance of one album result for the query tokens `qt`.
+
+    MusicBrainz gives every exact title match the same score, so on its own it can't tell
+    Kanye West's "Graduation" from a dozen obscure records with that name. Editions (a
+    release group with many pressings is a well-known record) and Crescendo activity
+    (people here already rate it) break those ties."""
+    title_t, artist_t = tokens(a["title"]), tokens(a["artist"])
+    score = mb_score
+    if title_t and title_t <= qt:
+        score += 25
+    if artist_t and artist_t <= qt:
+        score += 15
+    if title_t and artist_t and (title_t | artist_t) >= qt:
+        score += 25
+    score += {"Album": 20, "EP": 8}.get(a.get("type"), 0)
+    score += 11 * math.log1p(a.get("editions") or 0)
+    if a.get("editions", 0) <= 1 and not (artist_t & qt):
+        score -= 10  # a one-off release whose artist the query doesn't mention
+    if set(a.get("secondary") or []) & MINOR_SECONDARY:
+        score -= 12
+    score += 15 * math.log1p(heat)
+    return score
+
+
+def album_heat(ids):
+    """album id -> number of ratings and listen-later saves on Crescendo."""
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    return {r["album_mbid"]: r["n"] for r in rows(f"""
+        SELECT album_mbid, COUNT(*) AS n FROM (
+            SELECT album_mbid FROM song_ratings WHERE album_mbid IN ({marks})
+            UNION ALL SELECT album_mbid FROM album_ratings WHERE album_mbid IN ({marks})
+            UNION ALL SELECT album_mbid FROM listen_later WHERE album_mbid IN ({marks})
+        ) GROUP BY album_mbid
+    """, list(ids) * 3)}
+
+
+def search_albums(q, limit=24):
     esc = lucene_escape(q)
-    data = mb_get("release-group", {"query": f"releasegroup:({esc})^3 OR artist:({esc}) OR ({esc})", "limit": 30},
+    # 100 is MusicBrainz's maximum page size and costs the same single request as 30;
+    # the extra candidates are what let well-known records surface for common titles.
+    data = mb_get("release-group", {"query": f"releasegroup:({esc})^3 OR artist:({esc}) OR ({esc})", "limit": 100},
                   ttl=86400)
     qt = tokens(q)
-    results = []
+    found = {}
+    mb_scores = {}
     for rg in data.get("release-groups") or []:
         credits = rg.get("artist-credit") or []
-        title_t, artist_t = tokens(rg["title"]), tokens(credit_string(credits))
-        score = rg.get("score", 0)
-        if title_t and title_t <= qt:
-            score += 25
-        if artist_t and artist_t <= qt:
-            score += 15
-        if title_t and artist_t and (title_t | artist_t) >= qt:
-            score += 25
-        score += {"Album": 20, "EP": 8}.get(rg.get("primary-type"), 0)
-        score += 7 * math.log1p(rg.get("count") or 0)  # many editions ~ well-known record
-        if set(rg.get("secondary-types") or []) & {"Compilation", "Live", "Remix", "DJ-mix", "Mixtape/Street"}:
-            score -= 12
-        results.append((score, rg))
-    results.sort(key=lambda x: -x[0])
-    out = []
-    for _, rg in results[:24]:
-        credits = rg.get("artist-credit") or []
-        out.append({
+        found[rg["id"]] = {
             "id": rg["id"], "title": rg["title"], "artist": credit_string(credits),
             "artist_id": credits[0]["artist"]["id"] if credits else None,
             "year": year_of(rg.get("first-release-date")), "type": rg.get("primary-type"),
             "secondary": rg.get("secondary-types") or [], "editions": rg.get("count") or 0,
-        })
-    return out
+        }
+        mb_scores[rg["id"]] = rg.get("score", 0)
+    # Albums people already rate on Crescendo count even when MusicBrainz's page left them out.
+    for a in known_albums(q):
+        if a["id"] not in found:
+            found[a["id"]] = a
+            mb_scores[a["id"]] = 100
+    heat = album_heat(list(found))
+    ranked = sorted(found.values(), key=lambda a: -rank_album(a, qt, mb_scores[a["id"]], heat.get(a["id"], 0)))
+    return ranked[:limit]
+
+
+def known_albums(q, limit=12):
+    """Locally stored albums matching every word of `q` that have Crescendo activity."""
+    params = like_terms(q)
+    if not params:
+        return []
+    hay = "lower(al.title || ' ' || COALESCE(NULLIF(al.artist_credit, ''), ar.name, ''))"
+    cond = " AND ".join(f"{hay} LIKE :{k} ESCAPE '\\'" for k in params)
+    found = rows(f"""
+        SELECT al.mbid AS id, al.title, COALESCE(NULLIF(al.artist_credit, ''), ar.name, '') AS artist,
+               al.artist_mbid AS artist_id, al.year, al.primary_type AS type, al.secondary_types AS secondary
+        FROM albums al LEFT JOIN artists ar ON ar.mbid = al.artist_mbid
+        WHERE {cond} AND (EXISTS (SELECT 1 FROM song_ratings WHERE album_mbid = al.mbid)
+                          OR EXISTS (SELECT 1 FROM album_ratings WHERE album_mbid = al.mbid)
+                          OR EXISTS (SELECT 1 FROM listen_later WHERE album_mbid = al.mbid))
+        LIMIT {int(limit)}
+    """, params)
+    for a in found:
+        a["secondary"] = json.loads(a["secondary"] or "[]")
+        a["editions"] = 0
+    return found
+
+
+def artist_first(albums, artist_id):
+    """Stable re-order: the named artist's own releases ahead of everyone else's."""
+    return sorted(albums, key=lambda a: a.get("artist_id") != artist_id)
 
 
 def search_artists(q):
@@ -725,16 +942,35 @@ def user_scores(user_id):
     return out
 
 
-def taste_match(a_id, b_id, cache=None):
-    def get(uid):
-        if cache is not None and uid in cache:
-            return cache[uid]
-        v = (user_genre_vector(uid), user_scores(uid))
-        if cache is not None:
-            cache[uid] = v
-        return v
+# Each user's (genre vector, scores) is cached in memory and dropped whenever it can
+# change: when they rate something, when their account goes, or when album genres are
+# (re)loaded. Without it the People page recomputes every listener's profile per visit.
+_taste_cache = {}
+_taste_lock = threading.Lock()
 
-    (ga, sa), (gb, sb) = get(a_id), get(b_id)
+
+def forget_taste(user_id=None):
+    """Invalidate one user's cached taste profile, or everyone's when user_id is None."""
+    with _taste_lock:
+        if user_id is None:
+            _taste_cache.clear()
+        else:
+            _taste_cache.pop(user_id, None)
+
+
+def taste_profile(uid):
+    with _taste_lock:
+        hit = _taste_cache.get(uid)
+    if hit is not None:
+        return hit
+    profile = (user_genre_vector(uid), user_scores(uid))
+    with _taste_lock:
+        _taste_cache[uid] = profile
+    return profile
+
+
+def taste_match(a_id, b_id):
+    (ga, sa), (gb, sb) = taste_profile(a_id), taste_profile(b_id)
     if not ga or not gb:
         return None
     dot = sum(ga[g] * gb[g] for g in ga.keys() & gb.keys())
@@ -892,9 +1128,32 @@ def mb_call(fn, *args):
 
 # --- auth -----------------------------------------------------------------
 
+def self_user(u):
+    """The signed-in user's own view of their account (includes how they sign in)."""
+    return dict(public_user(u), has_password=has_password(u), google=bool(u.get("google_sub")))
+
+
+def check_username(username):
+    if not USERNAME_RE.match(username):
+        raise ApiError(400, "Usernames are 3–24 characters: letters, numbers, dots and underscores.")
+
+
+def check_new_password(password):
+    if len(password) < 8:
+        raise ApiError(400, "Passwords need at least 8 characters.")
+    if len(password) > 200:
+        raise ApiError(400, "That password is too long.")
+
+
+@route("GET", "/api/config")
+def api_config(req):
+    """Public, non-secret settings the front end needs (which sign-in options are on)."""
+    return {"google_client_id": GOOGLE_CLIENT_ID or None, "turnstile_sitekey": TURNSTILE_SITEKEY or None}
+
+
 @route("GET", "/api/me")
 def api_me(req):
-    return {"user": public_user(req.user) if req.user else None}
+    return {"user": self_user(req.user) if req.user else None}
 
 
 @route("POST", "/api/auth/register")
@@ -902,32 +1161,119 @@ def api_register(req):
     body = req.json()
     username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
-    if not USERNAME_RE.match(username):
-        raise ApiError(400, "Usernames are 3–24 characters: letters, numbers, dots and underscores.")
-    if len(password) < 8:
-        raise ApiError(400, "Passwords need at least 8 characters.")
-    if len(password) > 200:
-        raise ApiError(400, "That password is too long.")
+    check_username(username)
+    check_new_password(password)
+    if not verify_turnstile(str(body.get("captcha") or ""), req.client_ip):
+        raise ApiError(400, "Please complete the “I'm not a robot” check and try again.")
     try:
         cur = db().execute("INSERT INTO users (username, password_hash, created_at) VALUES (?,?,?)",
                            (username, hash_password(password), now()))
     except sqlite3.IntegrityError:
         raise ApiError(409, "That username is already taken.")
     req.set_session(create_session(cur.lastrowid))
-    return {"user": public_user(one("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)))}
+    return {"user": self_user(one("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)))}
 
 
 @route("POST", "/api/auth/login")
 def api_login(req):
-    if too_many_failures(req.client_ip):
-        raise ApiError(429, "Too many attempts. Wait a few minutes and try again.")
     body = req.json()
-    user = one("SELECT * FROM users WHERE username = ?", (str(body.get("username", "")).strip(),))
-    if not user or not verify_password(str(body.get("password", "")), user["password_hash"]):
-        record_failure(req.client_ip)
+    username = str(body.get("username", "")).strip()[:64]
+    if too_many_failures(req.client_ip, username):
+        raise ApiError(429, "Too many attempts. Wait a few minutes and try again.")
+    user = one("SELECT * FROM users WHERE username = ?", (username,))
+    password = str(body.get("password", ""))
+    ok = verify_password(password, user["password_hash"]) if user and has_password(user) \
+        else (verify_password(password, _DUMMY_HASH) and False)
+    if not ok:
+        record_failure(req.client_ip, username)
+        if user and not has_password(user):
+            raise ApiError(401, "This account signs in with Google. Use “Continue with Google”.")
         raise ApiError(401, "Incorrect username or password.")
+    clear_failures(req.client_ip, username)
     req.set_session(create_session(user["id"]))
-    return {"user": public_user(user)}
+    return {"user": self_user(user)}
+
+
+@route("POST", "/api/auth/google")
+def api_google(req):
+    """Sign in (or sign up) with a Google ID token from Google Identity Services.
+
+    Existing linked accounts are signed straight in. A first-time Google user picks a
+    username: the first call answers needs_username, the second sends it back."""
+    if not GOOGLE_CLIENT_ID:
+        raise ApiError(404, "Google sign-in isn't set up on this server.")
+    body = req.json()
+    claims = verify_google_credential(str(body.get("credential") or ""))
+    if not claims:
+        raise ApiError(401, "Google couldn't confirm that sign-in. Try again.")
+    user = one("SELECT * FROM users WHERE google_sub = ?", (claims["sub"],))
+    if user:
+        req.set_session(create_session(user["id"]))
+        return {"user": self_user(user)}
+    username = str(body.get("username") or "").strip()
+    if not username:
+        return {"needs_username": True, "suggestion": username_suggestion(claims)}
+    check_username(username)
+    try:
+        cur = db().execute("INSERT INTO users (username, password_hash, google_sub, created_at) VALUES (?,?,?,?)",
+                           (username, "", claims["sub"], now()))
+    except sqlite3.IntegrityError:
+        raise ApiError(409, "That username is already taken.")
+    req.set_session(create_session(cur.lastrowid))
+    return {"user": self_user(one("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)))}
+
+
+# --- account settings -------------------------------------------------------
+
+@route("POST", "/api/me/password")
+def api_change_password(req):
+    """Change the password (or set one, for an account created with Google)."""
+    user = require_user(req)
+    body = req.json()
+    new = str(body.get("new_password", ""))
+    if has_password(user):
+        current = str(body.get("current_password", ""))
+        if too_many_failures(req.client_ip, user["username"]):
+            raise ApiError(429, "Too many attempts. Wait a few minutes and try again.")
+        if not verify_password(current, user["password_hash"]):
+            record_failure(req.client_ip, user["username"])
+            raise ApiError(401, "Your current password isn't right.")
+    check_new_password(new)
+    with Tx() as c:
+        c.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new), user["id"]))
+        # Sign out every other device: whoever might have known the old password is out.
+        c.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?",
+                  (user["id"], token_hash(req.session_token)))
+    return {"user": self_user(one("SELECT * FROM users WHERE id = ?", (user["id"],)))}
+
+
+@route("POST", "/api/me/logout-all")
+def api_logout_all(req):
+    user = require_user(req)
+    db().execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+    req.clear_session()
+    return {"ok": True}
+
+
+@route("DELETE", "/api/me")
+def api_delete_me(req):
+    """Delete the account and everything in it (ratings, reviews, follows, sessions).
+
+    Password accounts confirm with their password; Google-only accounts type their username."""
+    user = require_user(req)
+    body = req.json()
+    if has_password(user):
+        if too_many_failures(req.client_ip, user["username"]):
+            raise ApiError(429, "Too many attempts. Wait a few minutes and try again.")
+        if not verify_password(str(body.get("password", "")), user["password_hash"]):
+            record_failure(req.client_ip, user["username"])
+            raise ApiError(401, "That password isn't right, so nothing was deleted.")
+    elif str(body.get("confirm", "")).strip().lower() != user["username"].lower():
+        raise ApiError(400, "Type your username exactly to confirm.")
+    db().execute("DELETE FROM users WHERE id = ?", (user["id"],))  # cascades to everything they own
+    forget_taste(user["id"])
+    req.clear_session()
+    return {"deleted": True}
 
 
 @route("POST", "/api/auth/logout")
@@ -1033,7 +1379,7 @@ def api_search(req):
         discography = albums_by_ids(ids, req.user["id"] if req.user else None)
         if discography:
             in_discography = set(ids)
-            out["results"] = [a for a in albums if a["id"] not in in_discography]
+            out["results"] = artist_first([a for a in albums if a["id"] not in in_discography], artist["id"])
             out["artist"] = {k: artist.get(k) for k in ARTIST_PUBLIC_FIELDS}
             out["artist_albums"] = discography
             # ...unless the "artist" is a minor act sharing its name with a well-known album
@@ -1051,7 +1397,11 @@ def api_suggest(req):
     if len(q) < 2:
         return {"albums": [], "artists": []}
     albums, artists = mb_call(parallel, (search_albums, q), (search_artists, q))
-    return {"albums": attach_album_stats(albums[:6]), "artists": artists[:4]}
+    artist = artist_for_query(q, artists)
+    if artist:
+        albums = artist_first(albums, artist["id"])
+    return {"albums": attach_album_stats(albums[:6]),
+            "artists": [{k: a.get(k) for k in ARTIST_PUBLIC_FIELDS} for a in artists[:4]]}
 
 
 @route("GET", "/api/album/(?P<rgid>[^/]+)")
@@ -1156,6 +1506,7 @@ def api_rate_song(req):
             "VALUES (?,?,?,?,?,?) ON CONFLICT(user_id, song_mbid) DO UPDATE SET "
             "score = excluded.score, album_mbid = excluded.album_mbid, updated_at = excluded.updated_at",
             (user["id"], song, album, score, t, t))
+    forget_taste(user["id"])
     s = one("SELECT AVG(score) AS avg, COUNT(*) AS count FROM song_ratings WHERE song_mbid = ?", (song,))
     return {"score": score, "avg": s["avg"], "count": s["count"]}
 
@@ -1167,6 +1518,8 @@ def api_rate_album(req):
     album = require_mbid(body.get("album"))
     score = parse_score(body.get("score"))
     review = str(body.get("review") or "").strip()[:2000]
+    if score is None and review:
+        raise ApiError(400, "Give a star rating to save a review with it.")
     if not one("SELECT 1 AS x FROM albums WHERE mbid = ?", (album,)):
         raise ApiError(404, "Unknown album.")
     t = now()
@@ -1179,6 +1532,7 @@ def api_rate_album(req):
             "score = excluded.score, review = excluded.review, updated_at = excluded.updated_at",
             (user["id"], album, score, review, t, t))
         db().execute("DELETE FROM listen_later WHERE user_id = ? AND album_mbid = ?", (user["id"], album))
+    forget_taste(user["id"])
     s = one("SELECT AVG(score) AS avg, COUNT(*) AS count FROM album_ratings WHERE album_mbid = ?", (album,))
     return {"score": score, "avg": s["avg"], "count": s["count"]}
 
@@ -1190,6 +1544,8 @@ def api_rate_artist(req):
     artist = require_mbid(body.get("artist"))
     score = parse_score(body.get("score"))
     review = str(body.get("review") or "").strip()[:2000]
+    if score is None and review:
+        raise ApiError(400, "Give a star rating to save a review with it.")
     if not one("SELECT 1 AS x FROM artists WHERE mbid = ?", (artist,)):
         raise ApiError(404, "Unknown artist.")
     t = now()
@@ -1201,6 +1557,7 @@ def api_rate_artist(req):
             "VALUES (?,?,?,?,?,?) ON CONFLICT(user_id, artist_mbid) DO UPDATE SET "
             "score = excluded.score, review = excluded.review, updated_at = excluded.updated_at",
             (user["id"], artist, score, review, t, t))
+    forget_taste(user["id"])
     s = one("SELECT AVG(score) AS avg, COUNT(*) AS count FROM artist_ratings WHERE artist_mbid = ?", (artist,))
     return {"score": score, "avg": s["avg"], "count": s["count"]}
 
@@ -1244,7 +1601,7 @@ def api_user(req, username):
     dist = [0] * 10
     for r in rows("SELECT score, COUNT(*) AS n FROM song_ratings WHERE user_id = ? GROUP BY score", (uid,)):
         dist[r["score"] - 1] = r["n"]
-    genres = sorted(user_genre_vector(uid).items(), key=lambda kv: -kv[1])[:10]
+    genres = sorted(taste_profile(uid)[0].items(), key=lambda kv: -kv[1])[:10]
     top_w = genres[0][1] if genres else 1
     top_albums = rows("""
         SELECT al.mbid AS id, al.title, al.artist_credit AS artist, al.year, ar.score, ar.review
@@ -1337,18 +1694,17 @@ def api_people(req):
     if viewer:
         following = {r["followee_id"] for r in rows("SELECT followee_id FROM follows WHERE follower_id = ?",
                                                     (viewer["id"],))}
-    cache = {}
     out = []
     for u in active:
         if viewer and u["id"] == viewer["id"]:
             continue
         if not u["ratings"]:
             continue
-        g = sorted(user_genre_vector(u["id"]).items(), key=lambda kv: -kv[1])[:3]
+        g = sorted(taste_profile(u["id"])[0].items(), key=lambda kv: -kv[1])[:3]
         item = dict(public_user(u), ratings=u["ratings"], top_genres=[x[0] for x in g],
                     following=u["id"] in following)
         if viewer:
-            item["match"] = taste_match(viewer["id"], u["id"], cache)
+            item["match"] = taste_match(viewer["id"], u["id"])
         out.append(item)
     if viewer:
         out.sort(key=lambda x: -(x["match"]["percent"] if x["match"] else -1))
@@ -1403,6 +1759,37 @@ def api_home(req):
 
 # --- request handler ------------------------------------------------------
 
+# What the page may load. Scripts only from this server, Google's sign-in button and
+# Cloudflare's robot check; no inline scripts; and no other site may frame the page
+# (stops clickjacking). Inline *styles* stay allowed: the UI sets CSS variables inline.
+CSP = "; ".join([
+    "default-src 'self'",
+    "script-src 'self' https://accounts.google.com/gsi/client https://challenges.cloudflare.com",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com/gsi/style",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data: https:",  # cover art comes from the Cover Art Archive's many mirrors
+    "connect-src 'self' https://accounts.google.com/gsi/",
+    "frame-src https://accounts.google.com/gsi/ https://challenges.cloudflare.com",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "object-src 'none'",
+])
+
+def session_cookie_value(header):
+    """Our session token from a Cookie header, ignoring every other cookie.
+
+    http.cookies.SimpleCookie gives up on the *whole* header when any one cookie isn't
+    RFC-clean, and other scripts on the page set such cookies (Google's sign-in button
+    sets g_state={...json...}), which silently logged people out. So split it by hand."""
+    for part in (header or "").split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name == SESSION_COOKIE:
+            value = value.strip().strip('"')
+            return value if re.fullmatch(r"[A-Za-z0-9_\-]{20,100}", value) else None
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Crescendo/1.0"
     protocol_version = "HTTP/1.1"
@@ -1434,20 +1821,12 @@ class Handler(BaseHTTPRequestHandler):
     def _load_user(self):
         self.user = None
         self.session_token = None
-        raw = self.headers.get("Cookie")
-        if not raw:
+        token = session_cookie_value(self.headers.get("Cookie"))
+        if not token:
             return
-        cookie = SimpleCookie()
-        try:
-            cookie.load(raw)
-        except Exception:
-            return
-        morsel = cookie.get(SESSION_COOKIE)
-        if not morsel or not morsel.value:
-            return
-        self.session_token = morsel.value
+        self.session_token = token
         r = one("SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id "
-                "WHERE s.token_hash = ? AND s.expires_at > ?", (token_hash(morsel.value), now()))
+                "WHERE s.token_hash = ? AND s.expires_at > ?", (token_hash(token), now()))
         self.user = r
 
     def _send(self, status, body, content_type, extra_headers=()):
@@ -1456,6 +1835,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("X-Frame-Options", "DENY")  # older browsers; CSP frame-ancestors covers new ones
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
         for k, v in extra_headers:
             self.send_header(k, v)
         for c in getattr(self, "_cookies_out", []):
@@ -1585,11 +1967,16 @@ def seed_demo():
         print(f"  ✓ {hit['title']} — {hit['artist']}")
 
     t0 = now() - 10 * 86400
+    created = []
     for name, bio, bias in DEMO_USERS:
         if one("SELECT 1 AS x FROM users WHERE username = ?", (name,)):
             continue
+        # A fresh random password per account, shown once below. A fixed, published demo
+        # password would let anyone log in as these users on a public server.
+        password = secrets.token_urlsafe(9)
+        created.append((name, password))
         cur = db().execute("INSERT INTO users (username, password_hash, bio, created_at) VALUES (?,?,?,?)",
-                           (name, hash_password("password123"), bio, t0))
+                           (name, hash_password(password), bio, t0))
         uid = cur.lastrowid
         for rgid in rng.sample(album_ids, k=min(len(album_ids), rng.randint(7, 11))):
             album_taste = rng.gauss(7 + bias * 2, 1.4)
@@ -1609,7 +1996,12 @@ def seed_demo():
         for b in users:
             if a != b and rng.random() < 0.6:
                 db().execute("INSERT OR IGNORE INTO follows VALUES (?,?,?)", (a, b, t0))
-    print("Done. Demo logins: mustafa / elif_k / can.polat — password: password123")
+    if created:
+        print("Done. Demo logins (shown only now — note them down):")
+        for name, password in created:
+            print(f"  {name:<10} {password}")
+    else:
+        print("Done. The demo accounts already existed; their passwords were not changed.")
 
 
 def main():
