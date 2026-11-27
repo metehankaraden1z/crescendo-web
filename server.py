@@ -1049,25 +1049,37 @@ def recent_activity(where_sql="", params=(), limit=30):
             FROM artist_ratings rr JOIN users u ON u.id = rr.user_id JOIN artists a ON a.mbid = rr.artist_mbid
         ) {where_sql} ORDER BY at DESC LIMIT 400
     """, params)
-    out = []
+    # One row per listener per album per sitting: the track ratings and the album rating that a
+    # rating session produces are folded together instead of showing up as separate entries.
+    out, groups = [], {}
     for e in events:
-        prev = out[-1] if out else None
-        if (e["kind"] == "song" and prev and prev["kind"] == "songs" and prev["user_id"] == e["user_id"]
-                and prev["album_id"] == e["album_id"] and prev["at"] - e["at"] < 6 * 3600):
-            prev["scores"].append(e["score"])
-            continue
+        key = (e["user_id"], e["album_id"]) if e["album_id"] else None
+        g = groups.get(key) if key else None
+        if g is None or g["at"] - e["at"] >= 6 * 3600:
+            if len(out) >= limit:
+                continue
+            g = dict(e, scores=[], album_score=None, first_title=None)
+            out.append(g)
+            if key:
+                groups[key] = g
         if e["kind"] == "song":
-            e = dict(e, kind="songs", scores=[e["score"]], first_title=e["item_title"])
-        out.append(e)
-        if len(out) >= limit:
-            break
-    for e in out:
-        if e["kind"] == "songs":
-            e["n"] = len(e["scores"])
-            e["score"] = sum(e["scores"]) / len(e["scores"])
-            if e["n"] > 1:
-                e["item_title"] = None
-            del e["scores"]
+            g["scores"].append(e["score"])
+            g["first_title"] = e["item_title"]
+        elif e["kind"] == "album" and g["album_score"] is None:
+            g["album_score"] = e["score"]
+            g["review"] = e["review"]
+    for g in out:
+        scores, album_score = g.pop("scores"), g.pop("album_score")
+        if g["kind"] == "artist":
+            continue
+        g["n"] = len(scores)
+        g["track_avg"] = sum(scores) / len(scores) if scores else None
+        if album_score is not None:
+            g["kind"], g["score"] = "album", album_score
+        else:
+            g["kind"], g["score"] = "songs", g["track_avg"]
+        if g["n"] != 1:
+            g["item_title"] = None
     return out
 
 
