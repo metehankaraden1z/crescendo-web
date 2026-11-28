@@ -352,7 +352,7 @@ async function applyPendingRating() {
   try {
     const p = JSON.parse(raw);
     await rate(p.kind, p.id, p.album, p.score, null);
-    toast("Rating saved. Welcome to Crescendo.");
+    toast("Rating saved");
   } catch { /* ignore */ }
 }
 
@@ -452,7 +452,7 @@ async function finishAuth(user, { created = false, reason = "" } = {}) {
   prefetched.clear();
   closeModal();
   await applyPendingRating();
-  if (created && reason !== "rate") toast(`Welcome, ${user.username}! Search an album to start rating.`);
+  if (created && reason !== "rate") toast("Account created. Search an album to start rating.");
   if (session) { session.stale = true; renderTopbar(); } else render();
 }
 
@@ -843,7 +843,7 @@ function welcomeHTML(d) {
   const profile = `#/u/${encodeURIComponent(me.username)}`;
   return `
   <section class="welcome page-top"><div class="wrap">
-    <h1>${fresh ? `Let's rate your first album, ${esc(me.username)}.` : `What are we rating today, ${esc(me.username)}?`}</h1>
+    <h1>${fresh ? "Rate your first album" : "Rate an album"}</h1>
     ${heroSearchHTML("Search an album to rate")}
     ${fresh ? "" : `<p class="my-stats"><span><b>${num(c.songs)}</b> songs</span><span><b>${num(c.albums)}</b> albums</span><span><b>${num(c.artists)}</b> artists rated</span>
       <a href="${profile}">See my Taste DNA</a></p>`}
@@ -1112,7 +1112,7 @@ VIEWS.album = async (view, route, alive) => {
     if (!state.me) return openAuth("join");
     const text = $("#review-text").value.trim();
     const score = model.mine && model.mine.score;
-    if (!score) { toast("Give the album a star rating first, then save your review.", true); $(".stars[data-kind=album]").focus(); return; }
+    if (!score) { toast("Give the album a star rating first, then save your review", true); $(".stars[data-kind=album]").focus(); return; }
     try {
       await api("PUT", "/api/ratings/album", { album: a.id, score, review: text });
       state.reviews[`album:${a.id}`] = text;
@@ -1302,7 +1302,7 @@ function renderSessionFinal(body) {
   $("[data-back]", body).addEventListener("click", () => sessionMove(-1));
   $("[data-save]", body).addEventListener("click", async () => {
     if (!state.me) { openAuth("join"); return; }
-    if (!session.albumScore) { toast("Pick a star rating for the album first.", true); stars.focus(); return; }
+    if (!session.albumScore) { toast("Pick a star rating for the album first", true); stars.focus(); return; }
     const review = $("#final-review", body).value.trim();
     try {
       const res = await api("PUT", "/api/ratings/album", { album: model.album.id, score: session.albumScore, review });
@@ -1589,7 +1589,7 @@ async function openAccount() {
     try { await api("POST", "/api/me/logout-all"); } catch (ex) { return toast(ex.message, true); }
     state.me = null;
     closeModal();
-    toast("Signed out of every device.");
+    toast("Signed out of every device");
     location.hash = "#/";
     render();
   });
@@ -1608,7 +1608,7 @@ async function openAccount() {
     }
     state.me = null;
     closeModal();
-    toast("Your account was deleted.");
+    toast("Your account was deleted");
     location.hash = "#/";
     render();
   });
